@@ -428,11 +428,12 @@ def _sid_identify(a_episodes, u_episodes, x_dim, sid_horizon):
     R = (v @ v.T) / NA
     R = (R + R.T) / 2
 
-    # identify B via least squares: x_{k+1} - A @ x_k = B @ u_k + w_k
-    # use reconstructed state sequences
-    Uii_flat = Uii  # (nu, NTot)
-    rhs = Xk_Plus1 - A @ Xk  # (nx, NTot)
-    B = (rhs @ Uii_flat.T) @ np.linalg.pinv(Uii_flat @ Uii_flat.T)  # (nx, nu)
+    # identify B: the Uf coefficients from the A regression contain the
+    # structured input effect. B is the first nu columns (corresponding to u_k).
+    # A_tmp = [A | B_uf], where B_uf maps [Uf] to Xk_Plus1.
+    # Uf is stacked as [u_k; u_{k+1}; ...; u_{k+iY-1}], so the first nu
+    # columns of B_uf correspond to u_k's effect on x_{k+1}, which is B.
+    B = A_tmp[:, nx:nx+nu]
 
     return A, B, C, Q, R
 
