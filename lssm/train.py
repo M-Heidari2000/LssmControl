@@ -459,6 +459,24 @@ def train_dynamics_sid(
         sid_horizon=config.sid_horizon,
     )
 
+    # normalize state basis so states have unit variance per dimension
+    # estimate state variance from data: run C^+ on all observations
+    C_pinv = np.linalg.pinv(C_id)
+    x_est = all_a @ C_pinv.T  # (N, x_dim)
+    x_std = x_est.std(axis=0)  # (x_dim,)
+    x_std = np.maximum(x_std, 1e-6)  # avoid division by zero
+
+    # similarity transform: x_new = T @ x_old, where T = diag(1/std)
+    T = np.diag(1.0 / x_std)
+    T_inv = np.diag(x_std)
+    A_id = T @ A_id @ T_inv
+    B_id = T @ B_id
+    C_id = C_id @ T_inv
+    Q = T @ Q @ T.T
+    # R is unchanged (observation space)
+
+    print(f"  State normalization: x_std = {x_std}")
+
     # create Dynamics model with full noise covariances (via Cholesky)
     dynamics_model = Dynamics(
         x_dim=config.x_dim,
