@@ -1,7 +1,6 @@
 import torch
 import wandb
 import einops
-import logging
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
@@ -15,8 +14,6 @@ from .models import (
     Dynamics,
     CostModel,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def train_autoencoder(
@@ -276,47 +273,6 @@ def train_dynamics(
                     "global_step": update,
                 })
 
-    # --- diagnostics: posterior state stats ---
-    with torch.no_grad():
-        y, u, _, _ = train_buffer.sample(batch_size=32, chunk_length=config.chunk_length)
-        y_t = torch.as_tensor(y, device=device)
-        y_t = einops.rearrange(y_t, "b l y -> l b y")
-        a_t = encoder(einops.rearrange(y_t, "l b y -> (l b) y"))
-        a_t = einops.rearrange(a_t, "(l b) a -> l b a", b=32)
-        u_t = torch.as_tensor(u, device=device)
-        u_t = einops.rearrange(u_t, "b l u -> l b u")
-
-        _, posteriors = dynamics_model(a=a_t, u=u_t)
-        x_posterior = bottle_mvn(posteriors).loc
-        x_posterior = einops.rearrange(x_posterior, "(l b) x -> l b x", b=32)
-
-        x_mean = x_posterior.mean().item()
-        x_std = x_posterior.std().item()
-        x_min = x_posterior.min().item()
-        x_max = x_posterior.max().item()
-
-        first_cov = posteriors[0].covariance_matrix[0]
-        last_cov = posteriors[-1].covariance_matrix[0]
-        print(f"[prediction] Posterior x stats: mean={x_mean:.4f}, std={x_std:.4f}, min={x_min:.4f}, max={x_max:.4f}")
-        print(f"[prediction] Posterior cov trace (t=0): {first_cov.trace().item():.6f}")
-        print(f"[prediction] Posterior cov trace (t={config.chunk_length-1}): {last_cov.trace().item():.6f}")
-        print(f"[prediction] Posterior cov (t=0):\n{first_cov.cpu().numpy()}")
-        print(f"[prediction] Posterior cov (t={config.chunk_length-1}):\n{last_cov.cpu().numpy()}")
-
-        x_flat = einops.rearrange(x_posterior, "l b x -> (l b) x")
-        a_recon = dynamics_model.get_a(x_flat)
-        a_true = einops.rearrange(a_t, "l b a -> (l b) a")
-        recon_mse = nn.MSELoss()(a_recon, a_true).item()
-        print(f"[prediction] C @ x_posterior vs a reconstruction MSE: {recon_mse:.6f}")
-
-        A_dyn, B_dyn, C_dyn, Nx_dyn, Na_dyn = dynamics_model.get_dynamics(x_flat[:1])
-        print(f"[prediction] A:\n{A_dyn[0].cpu().numpy()}")
-        print(f"[prediction] B:\n{B_dyn[0].cpu().numpy()}")
-        print(f"[prediction] C:\n{C_dyn[0].cpu().numpy()}")
-        print(f"[prediction] Nx:\n{Nx_dyn[0].cpu().numpy()}")
-        print(f"[prediction] Na:\n{Na_dyn[0].cpu().numpy()}")
-        print(f"[prediction] A eigenvalues: {torch.linalg.eigvals(A_dyn[0]).cpu().numpy()}")
-
     return dynamics_model
 
 
@@ -505,56 +461,6 @@ def train_dynamics_sid(
     for p in dynamics_model.parameters():
         p.requires_grad = False
     dynamics_model.eval()
-
-    print("SID identification complete.")
-    print(f"  A:\n{A_id}")
-    print(f"  B:\n{B_id}")
-    print(f"  C:\n{C_id}")
-    print(f"  Q:\n{Q}")
-    print(f"  R:\n{R}")
-    print(f"  A eigenvalues: {np.linalg.eigvals(A_id)}")
-
-    # --- diagnostics: compare posterior states with ground truth ---
-    with torch.no_grad():
-        # sample a chunk from train buffer
-        y, u, _, _ = train_buffer.sample(batch_size=32, chunk_length=config.chunk_length)
-        y_t = torch.as_tensor(y, device=device)
-        y_t = einops.rearrange(y_t, "b l y -> l b y")
-        a_t = encoder(einops.rearrange(y_t, "l b y -> (l b) y"))
-        a_t = einops.rearrange(a_t, "(l b) a -> l b a", b=32)
-        u_t = torch.as_tensor(u, device=device)
-        u_t = einops.rearrange(u_t, "b l u -> l b u")
-
-        _, posteriors = dynamics_model(a=a_t, u=u_t)
-        x_posterior = bottle_mvn(posteriors).loc  # (T*B, x_dim)
-        x_posterior = einops.rearrange(x_posterior, "(l b) x -> l b x", b=32)
-
-        # posterior stats
-        x_mean = x_posterior.mean().item()
-        x_std = x_posterior.std().item()
-        x_min = x_posterior.min().item()
-        x_max = x_posterior.max().item()
-
-        # check Kalman covariance convergence: last vs first timestep
-        first_cov = posteriors[0].covariance_matrix[0]  # (x_dim, x_dim)
-        last_cov = posteriors[-1].covariance_matrix[0]
-        print(f"  Posterior x stats: mean={x_mean:.4f}, std={x_std:.4f}, min={x_min:.4f}, max={x_max:.4f}")
-        print(f"  Posterior cov trace (t=0): {first_cov.trace().item():.6f}")
-        print(f"  Posterior cov trace (t={config.chunk_length-1}): {last_cov.trace().item():.6f}")
-        print(f"  Posterior cov (t=0):\n{first_cov.cpu().numpy()}")
-        print(f"  Posterior cov (t={config.chunk_length-1}):\n{last_cov.cpu().numpy()}")
-
-        # check: does C @ x_posterior reconstruct a well?
-        x_flat = einops.rearrange(x_posterior, "l b x -> (l b) x")
-        a_recon = dynamics_model.get_a(x_flat)
-        a_true = einops.rearrange(a_t, "l b a -> (l b) a")
-        recon_mse = nn.MSELoss()(a_recon, a_true).item()
-        print(f"  C @ x_posterior vs a reconstruction MSE: {recon_mse:.6f}")
-
-        # check the actual Nx and Na being used
-        A_dyn, B_dyn, C_dyn, Nx_dyn, Na_dyn = dynamics_model.get_dynamics(x_flat[:1])
-        print(f"  Nx (process noise cov):\n{Nx_dyn[0].cpu().numpy()}")
-        print(f"  Na (observation noise cov):\n{Na_dyn[0].cpu().numpy()}")
 
     # evaluate on train and test data
     train_metrics = _evaluate_dynamics(config, encoder, dynamics_model, train_buffer, "train", device)
