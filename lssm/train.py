@@ -297,25 +297,25 @@ def train_dynamics(
 
         first_cov = posteriors[0].covariance_matrix[0]
         last_cov = posteriors[-1].covariance_matrix[0]
-        logger.info(f"[prediction] Posterior x stats: mean={x_mean:.4f}, std={x_std:.4f}, min={x_min:.4f}, max={x_max:.4f}")
-        logger.info(f"[prediction] Posterior cov trace (t=0): {first_cov.trace().item():.6f}")
-        logger.info(f"[prediction] Posterior cov trace (t={config.chunk_length-1}): {last_cov.trace().item():.6f}")
-        logger.info(f"[prediction] Posterior cov (t=0):\n{first_cov.cpu().numpy()}")
-        logger.info(f"[prediction] Posterior cov (t={config.chunk_length-1}):\n{last_cov.cpu().numpy()}")
+        print(f"[prediction] Posterior x stats: mean={x_mean:.4f}, std={x_std:.4f}, min={x_min:.4f}, max={x_max:.4f}")
+        print(f"[prediction] Posterior cov trace (t=0): {first_cov.trace().item():.6f}")
+        print(f"[prediction] Posterior cov trace (t={config.chunk_length-1}): {last_cov.trace().item():.6f}")
+        print(f"[prediction] Posterior cov (t=0):\n{first_cov.cpu().numpy()}")
+        print(f"[prediction] Posterior cov (t={config.chunk_length-1}):\n{last_cov.cpu().numpy()}")
 
         x_flat = einops.rearrange(x_posterior, "l b x -> (l b) x")
         a_recon = dynamics_model.get_a(x_flat)
         a_true = einops.rearrange(a_t, "l b a -> (l b) a")
         recon_mse = nn.MSELoss()(a_recon, a_true).item()
-        logger.info(f"[prediction] C @ x_posterior vs a reconstruction MSE: {recon_mse:.6f}")
+        print(f"[prediction] C @ x_posterior vs a reconstruction MSE: {recon_mse:.6f}")
 
         A_dyn, B_dyn, C_dyn, Nx_dyn, Na_dyn = dynamics_model.get_dynamics(x_flat[:1])
-        logger.info(f"[prediction] A:\n{A_dyn[0].cpu().numpy()}")
-        logger.info(f"[prediction] B:\n{B_dyn[0].cpu().numpy()}")
-        logger.info(f"[prediction] C:\n{C_dyn[0].cpu().numpy()}")
-        logger.info(f"[prediction] Nx:\n{Nx_dyn[0].cpu().numpy()}")
-        logger.info(f"[prediction] Na:\n{Na_dyn[0].cpu().numpy()}")
-        logger.info(f"[prediction] A eigenvalues: {torch.linalg.eigvals(A_dyn[0]).cpu().numpy()}")
+        print(f"[prediction] A:\n{A_dyn[0].cpu().numpy()}")
+        print(f"[prediction] B:\n{B_dyn[0].cpu().numpy()}")
+        print(f"[prediction] C:\n{C_dyn[0].cpu().numpy()}")
+        print(f"[prediction] Nx:\n{Nx_dyn[0].cpu().numpy()}")
+        print(f"[prediction] Na:\n{Na_dyn[0].cpu().numpy()}")
+        print(f"[prediction] A eigenvalues: {torch.linalg.eigvals(A_dyn[0]).cpu().numpy()}")
 
     return dynamics_model
 
@@ -449,7 +449,7 @@ def train_dynamics_sid(
         u_episodes.append(all_u[start:end + 1])  # (T_i, u_dim)
 
     total_samples = sum(len(ep) for ep in a_episodes)
-    logger.info(f"Running SID on {len(a_episodes)} episodes ({total_samples} total samples) with horizon i={config.sid_horizon}")
+    print(f"Running SID on {len(a_episodes)} episodes ({total_samples} total samples) with horizon i={config.sid_horizon}")
 
     # run SID identification
     A_id, B_id, C_id, Q, R = _sid_identify(
@@ -488,13 +488,13 @@ def train_dynamics_sid(
         p.requires_grad = False
     dynamics_model.eval()
 
-    logger.info("SID identification complete.")
-    logger.info(f"  A:\n{A_id}")
-    logger.info(f"  B:\n{B_id}")
-    logger.info(f"  C:\n{C_id}")
-    logger.info(f"  Q:\n{Q}")
-    logger.info(f"  R:\n{R}")
-    logger.info(f"  A eigenvalues: {np.linalg.eigvals(A_id)}")
+    print("SID identification complete.")
+    print(f"  A:\n{A_id}")
+    print(f"  B:\n{B_id}")
+    print(f"  C:\n{C_id}")
+    print(f"  Q:\n{Q}")
+    print(f"  R:\n{R}")
+    print(f"  A eigenvalues: {np.linalg.eigvals(A_id)}")
 
     # --- diagnostics: compare posterior states with ground truth ---
     with torch.no_grad():
@@ -520,23 +520,23 @@ def train_dynamics_sid(
         # check Kalman covariance convergence: last vs first timestep
         first_cov = posteriors[0].covariance_matrix[0]  # (x_dim, x_dim)
         last_cov = posteriors[-1].covariance_matrix[0]
-        logger.info(f"  Posterior x stats: mean={x_mean:.4f}, std={x_std:.4f}, min={x_min:.4f}, max={x_max:.4f}")
-        logger.info(f"  Posterior cov trace (t=0): {first_cov.trace().item():.6f}")
-        logger.info(f"  Posterior cov trace (t={config.chunk_length-1}): {last_cov.trace().item():.6f}")
-        logger.info(f"  Posterior cov (t=0):\n{first_cov.cpu().numpy()}")
-        logger.info(f"  Posterior cov (t={config.chunk_length-1}):\n{last_cov.cpu().numpy()}")
+        print(f"  Posterior x stats: mean={x_mean:.4f}, std={x_std:.4f}, min={x_min:.4f}, max={x_max:.4f}")
+        print(f"  Posterior cov trace (t=0): {first_cov.trace().item():.6f}")
+        print(f"  Posterior cov trace (t={config.chunk_length-1}): {last_cov.trace().item():.6f}")
+        print(f"  Posterior cov (t=0):\n{first_cov.cpu().numpy()}")
+        print(f"  Posterior cov (t={config.chunk_length-1}):\n{last_cov.cpu().numpy()}")
 
         # check: does C @ x_posterior reconstruct a well?
         x_flat = einops.rearrange(x_posterior, "l b x -> (l b) x")
         a_recon = dynamics_model.get_a(x_flat)
         a_true = einops.rearrange(a_t, "l b a -> (l b) a")
         recon_mse = nn.MSELoss()(a_recon, a_true).item()
-        logger.info(f"  C @ x_posterior vs a reconstruction MSE: {recon_mse:.6f}")
+        print(f"  C @ x_posterior vs a reconstruction MSE: {recon_mse:.6f}")
 
         # check the actual Nx and Na being used
         A_dyn, B_dyn, C_dyn, Nx_dyn, Na_dyn = dynamics_model.get_dynamics(x_flat[:1])
-        logger.info(f"  Nx (process noise cov):\n{Nx_dyn[0].cpu().numpy()}")
-        logger.info(f"  Na (observation noise cov):\n{Na_dyn[0].cpu().numpy()}")
+        print(f"  Nx (process noise cov):\n{Nx_dyn[0].cpu().numpy()}")
+        print(f"  Na (observation noise cov):\n{Na_dyn[0].cpu().numpy()}")
 
     # evaluate on train and test data
     train_metrics = _evaluate_dynamics(config, encoder, dynamics_model, train_buffer, "train", device)
