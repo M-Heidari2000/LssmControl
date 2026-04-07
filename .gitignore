@@ -17,3 +17,5 @@ pytest_cache/
 
 *.ipynb
 wandb/
+
+.claude/

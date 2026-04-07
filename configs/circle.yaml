@@ -1,0 +1,79 @@
+seed: 0
+log_dir: "./log"
+notes: "circle"
+run_name: "LSSM"
+
+data:
+  test_ratio: 0.2
+  num_episodes: 1000
+  action_repeat: 1
+  dist: normal  # env, normal, or uniform
+  u_std: 0.3   # std for normal dist
+  u_max: 0.3   # range for uniform dist [-u_max, u_max]
+
+env:
+  name: circle
+  horizon: 100
+  periodic: False
+
+  A:
+    - [1.0]
+  B:
+    - [0.1]
+  Ns:
+    - [0.01]
+  "No":
+    - [0.01, 0.0]
+    - [0.0, 0.01]
+
+train:
+  use_autoencoder: True
+  autoencoder:
+    num_updates: 1000
+    test_interval: 10
+    a_dim: 1
+    hidden_dim: 128
+    chunk_length: 48
+    batch_size: 128
+    lr: 1e-2
+    eps: 1e-8
+    weight_decay: 1e-6
+    clip_grad_norm: 1.0
+    disable_gpu: True
+  dynamics:
+    num_updates: 2000
+    test_interval: 10
+    x_dim: 1
+    a_dim: 1
+    hidden_dim: 128
+    min_var: 1e-2
+    max_var: 1.0
+    locally_linear: False
+    chunk_length: 48
+    prediction_k: 8
+    batch_size: 128
+    lr: 1e-2
+    eps: 1e-8
+    weight_decay: 1e-6
+    clip_grad_norm: 1.0
+    disable_gpu: True
+    filtering_weight: 0.1
+    mean_consistency_weight: 0.0
+    kl_consistency_weight: 0.0
+    kl_free_nats: 0.0
+  cost:
+    num_updates: 2500
+    test_interval: 10
+    chunk_length: 48
+    batch_size: 128
+    lr: 1e-2
+    eps: 1e-8
+    weight_decay: 1e-6
+    clip_grad_norm: 1.0
+    disable_gpu: True
+
+evaluation:
+  num_points: 1
+  num_regions: 1
+  deterministic: True
+  planning_horizon: 8
