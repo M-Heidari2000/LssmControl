@@ -350,92 +350,32 @@ def _evaluate_dynamics(
     return metrics
 
 
-def _sid_identify(a_episodes, u_episodes, x_dim, sid_horizon):
+def _sid_identify(a_data, u_data, x_dim, sid_horizon):
     """
         Subspace identification with inputs, without feedthrough (D=0).
-        Uses IPSID internals for the core SID steps (oblique projections, SVD),
-        then identifies B via simple least squares instead of the joint B/D solve.
+        Uses SIPPY's N4SID implementation.
+
+        Args:
+            a_data: (T, a_dim) concatenated observations
+            u_data: (T, u_dim) concatenated inputs
+            x_dim: latent state dimension
+            sid_horizon: block-row horizon for Hankel matrices
 
         Returns: A, B, C, Q, R (all numpy arrays)
     """
-    from PSID.PSID import blkhankskip, projOrth, getHSize
-    from PSID.IPSID import projOblique, removeProjOrth
-    from scipy import linalg
+    from sippy_unipi import system_identification
 
-    iY = sid_horizon
-    iMax = iY
-    ny = a_episodes[0].shape[1]
-    nu = u_episodes[0].shape[1]
+    sys_id = system_identification(
+        a_data, u_data,
+        id_method='N4SID',
+        SS_fixed_order=x_dim,
+        SS_f=sid_horizon,
+        SS_p=sid_horizon,
+        SS_D_required=False,
+        centering='None',
+    )
 
-    # compute per-episode valid lengths for Hankel construction
-    N = []
-    for ep in a_episodes:
-        T = ep.shape[0]
-        N.append(T - 2 * iMax + 1)
-
-    # build block Hankel matrices (IPSID-style, handles multi-episode via lists)
-    Yp = blkhankskip(a_episodes, iY, N, iMax - iY, time_first=True)
-    Yf = blkhankskip(a_episodes, iY, N, iMax, time_first=True)
-    Yii = blkhankskip(a_episodes, 1, N, iMax, time_first=True)
-    Up = blkhankskip(u_episodes, iY, N, iMax - iY, time_first=True)
-    Uf = blkhankskip(u_episodes, iY, N, iMax, time_first=True)
-
-    NTot = Yp.shape[1]
-    nx = x_dim
-
-    # Stage 2 (only stage, since n1=0): identify Y-predictive states
-    # oblique projection of Yf onto [Up, Yp] along Uf
-    YHatOb = projOblique(Yf, np.concatenate((Up, Yp)), Uf)[0]
-    YHatObUfRes = removeProjOrth(YHatOb, Uf)
-
-    # orthogonal projection of Yf onto [Up, Yp, Uf]
-    YHat = projOrth(Yf, np.concatenate((Up, Yp, Uf)))[0]
-
-    # for shifted states: Yf_Minus, Uf_Minus
-    Yf_Minus = Yf[ny:, :]
-    Uf_Minus = Uf[nu:, :]
-    Uii = blkhankskip(u_episodes, 1, N, iMax, time_first=True)
-    YHatMinus = projOrth(
-        Yf_Minus,
-        np.concatenate((Up, Uii, Yp, Yii, Uf_Minus)),
-    )[0]
-
-    # SVD
-    U2, S2_vals, _ = linalg.svd(YHatObUfRes, full_matrices=False, lapack_driver="gesvd")
-    S2 = np.diag(S2_vals[:nx])
-    U2 = U2[:, :nx]
-
-    Oy = U2 @ S2 ** (1 / 2)
-    Oy_Minus = Oy[:-ny, :]
-
-    Xk = np.linalg.pinv(Oy) @ YHat
-    Xk_Plus1 = np.linalg.pinv(Oy_Minus) @ YHatMinus
-
-    # identify A: regress Xk_Plus1 on [Xk, Uf] to project out input effects
-    XkP2Hat, A_tmp = projOrth(Xk_Plus1, np.concatenate((Xk, Uf)))
-    A = A_tmp[:, :nx]
-    w = Xk_Plus1 - XkP2Hat
-
-    # identify C: regress Yii on [Xk, Uf] to project out input effects
-    YiiHat, Cy_tmp = projOrth(Yii, np.concatenate((Xk, Uf)))
-    C = Cy_tmp[:, :nx]
-    v = Yii - YiiHat
-
-    # noise covariances (already clean — input effects projected out)
-    NA = w.shape[1]
-    Q = (w @ w.T) / NA
-    Q = (Q + Q.T) / 2
-    R = (v @ v.T) / NA
-    R = (R + R.T) / 2
-
-    # identify B: the Uf coefficients from the A regression contain the
-    # structured input effect. B is the first nu columns (corresponding to u_k).
-    # A_tmp = [A | B_uf], where B_uf maps [Uf] to Xk_Plus1.
-    # Uf is stacked as [u_k; u_{k+1}; ...; u_{k+iY-1}], so the first nu
-    # columns of B_uf correspond to u_k's effect on x_{k+1}, which is B.
-    B = A_tmp[:, nx:nx+nu]
-
-    return A, B, C, Q, R
+    return sys_id.A, sys_id.B, sys_id.C, sys_id.Q, sys_id.R
 
 
 def train_dynamics_sid(
@@ -462,25 +402,13 @@ def train_dynamics_sid(
         all_y = torch.as_tensor(train_buffer.ys[:len(train_buffer)], device=device)
         all_a = encoder(all_y).cpu().numpy()
     all_u = train_buffer.us[:len(train_buffer)]
-    all_done = train_buffer.done[:len(train_buffer)].flatten()
 
-    # split into per-episode lists
-    episode_ends = np.where(all_done)[0]
-    episode_starts = np.concatenate([[0], episode_ends[:-1] + 1])
-
-    a_episodes = []
-    u_episodes = []
-    for start, end in zip(episode_starts, episode_ends):
-        a_episodes.append(all_a[start:end + 1])  # (T_i, a_dim)
-        u_episodes.append(all_u[start:end + 1])  # (T_i, u_dim)
-
-    total_samples = sum(len(ep) for ep in a_episodes)
-    logger.info(f"Running SID on {len(a_episodes)} episodes ({total_samples} total samples) with horizon i={config.sid_horizon}")
+    logger.info(f"Running SID (N4SID) on {len(all_a)} samples with horizon i={config.sid_horizon}")
 
     # run SID identification (no D)
     A_id, B_id, C_id, Q, R = _sid_identify(
-        a_episodes=a_episodes,
-        u_episodes=u_episodes,
+        a_data=all_a,
+        u_data=all_u,
         x_dim=config.x_dim,
         sid_horizon=config.sid_horizon,
     )
