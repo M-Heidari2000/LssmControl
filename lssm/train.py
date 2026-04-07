@@ -276,6 +276,47 @@ def train_dynamics(
                     "global_step": update,
                 })
 
+    # --- diagnostics: posterior state stats ---
+    with torch.no_grad():
+        y, u, _, _ = train_buffer.sample(batch_size=32, chunk_length=config.chunk_length)
+        y_t = torch.as_tensor(y, device=device)
+        y_t = einops.rearrange(y_t, "b l y -> l b y")
+        a_t = encoder(einops.rearrange(y_t, "l b y -> (l b) y"))
+        a_t = einops.rearrange(a_t, "(l b) a -> l b a", b=32)
+        u_t = torch.as_tensor(u, device=device)
+        u_t = einops.rearrange(u_t, "b l u -> l b u")
+
+        _, posteriors = dynamics_model(a=a_t, u=u_t)
+        x_posterior = bottle_mvn(posteriors).loc
+        x_posterior = einops.rearrange(x_posterior, "(l b) x -> l b x", b=32)
+
+        x_mean = x_posterior.mean().item()
+        x_std = x_posterior.std().item()
+        x_min = x_posterior.min().item()
+        x_max = x_posterior.max().item()
+
+        first_cov = posteriors[0].covariance_matrix[0]
+        last_cov = posteriors[-1].covariance_matrix[0]
+        logger.info(f"[prediction] Posterior x stats: mean={x_mean:.4f}, std={x_std:.4f}, min={x_min:.4f}, max={x_max:.4f}")
+        logger.info(f"[prediction] Posterior cov trace (t=0): {first_cov.trace().item():.6f}")
+        logger.info(f"[prediction] Posterior cov trace (t={config.chunk_length-1}): {last_cov.trace().item():.6f}")
+        logger.info(f"[prediction] Posterior cov (t=0):\n{first_cov.cpu().numpy()}")
+        logger.info(f"[prediction] Posterior cov (t={config.chunk_length-1}):\n{last_cov.cpu().numpy()}")
+
+        x_flat = einops.rearrange(x_posterior, "l b x -> (l b) x")
+        a_recon = dynamics_model.get_a(x_flat)
+        a_true = einops.rearrange(a_t, "l b a -> (l b) a")
+        recon_mse = nn.MSELoss()(a_recon, a_true).item()
+        logger.info(f"[prediction] C @ x_posterior vs a reconstruction MSE: {recon_mse:.6f}")
+
+        A_dyn, B_dyn, C_dyn, Nx_dyn, Na_dyn = dynamics_model.get_dynamics(x_flat[:1])
+        logger.info(f"[prediction] A:\n{A_dyn[0].cpu().numpy()}")
+        logger.info(f"[prediction] B:\n{B_dyn[0].cpu().numpy()}")
+        logger.info(f"[prediction] C:\n{C_dyn[0].cpu().numpy()}")
+        logger.info(f"[prediction] Nx:\n{Nx_dyn[0].cpu().numpy()}")
+        logger.info(f"[prediction] Na:\n{Na_dyn[0].cpu().numpy()}")
+        logger.info(f"[prediction] A eigenvalues: {torch.linalg.eigvals(A_dyn[0]).cpu().numpy()}")
+
     return dynamics_model
 
 
@@ -350,32 +391,25 @@ def _evaluate_dynamics(
     return metrics
 
 
-def _sid_identify(a_data, u_data, x_dim, sid_horizon):
+def _sid_identify(a_episodes, u_episodes, x_dim, sid_horizon):
     """
-        Subspace identification with inputs, without feedthrough (D=0).
-        Uses SIPPY's N4SID implementation.
-
-        Args:
-            a_data: (T, a_dim) concatenated observations
-            u_data: (T, u_dim) concatenated inputs
-            x_dim: latent state dimension
-            sid_horizon: block-row horizon for Hankel matrices
-
+        Subspace identification with inputs using IPSID (n1=0, no behavioral signal).
         Returns: A, B, C, Q, R (all numpy arrays)
     """
-    from sippy_unipi import system_identification
+    from PSID import IPSID
 
-    sys_id = system_identification(
-        a_data, u_data,
-        id_method='N4SID',
-        SS_fixed_order=x_dim,
-        SS_f=sid_horizon,
-        SS_p=sid_horizon,
-        SS_D_required=False,
-        centering='None',
+    id_sys = IPSID(
+        Y=a_episodes,
+        Z=None,
+        U=u_episodes,
+        nx=x_dim,
+        n1=0,
+        i=sid_horizon,
+        remove_mean_Y=False,
+        remove_mean_U=False,
     )
 
-    return sys_id.A, sys_id.B, sys_id.C, sys_id.Q, sys_id.R
+    return id_sys.A, id_sys.B, id_sys.C, id_sys.Q, id_sys.R
 
 
 def train_dynamics_sid(
@@ -402,13 +436,25 @@ def train_dynamics_sid(
         all_y = torch.as_tensor(train_buffer.ys[:len(train_buffer)], device=device)
         all_a = encoder(all_y).cpu().numpy()
     all_u = train_buffer.us[:len(train_buffer)]
+    all_done = train_buffer.done[:len(train_buffer)].flatten()
 
-    logger.info(f"Running SID (N4SID) on {len(all_a)} samples with horizon i={config.sid_horizon}")
+    # split into per-episode lists (IPSID natively supports list of segments)
+    episode_ends = np.where(all_done)[0]
+    episode_starts = np.concatenate([[0], episode_ends[:-1] + 1])
 
-    # run SID identification (no D)
+    a_episodes = []
+    u_episodes = []
+    for start, end in zip(episode_starts, episode_ends):
+        a_episodes.append(all_a[start:end + 1])  # (T_i, a_dim)
+        u_episodes.append(all_u[start:end + 1])  # (T_i, u_dim)
+
+    total_samples = sum(len(ep) for ep in a_episodes)
+    logger.info(f"Running SID on {len(a_episodes)} episodes ({total_samples} total samples) with horizon i={config.sid_horizon}")
+
+    # run SID identification
     A_id, B_id, C_id, Q, R = _sid_identify(
-        a_data=all_a,
-        u_data=all_u,
+        a_episodes=a_episodes,
+        u_episodes=u_episodes,
         x_dim=config.x_dim,
         sid_horizon=config.sid_horizon,
     )
@@ -448,6 +494,49 @@ def train_dynamics_sid(
     logger.info(f"  C:\n{C_id}")
     logger.info(f"  Q:\n{Q}")
     logger.info(f"  R:\n{R}")
+    logger.info(f"  A eigenvalues: {np.linalg.eigvals(A_id)}")
+
+    # --- diagnostics: compare posterior states with ground truth ---
+    with torch.no_grad():
+        # sample a chunk from train buffer
+        y, u, _, _ = train_buffer.sample(batch_size=32, chunk_length=config.chunk_length)
+        y_t = torch.as_tensor(y, device=device)
+        y_t = einops.rearrange(y_t, "b l y -> l b y")
+        a_t = encoder(einops.rearrange(y_t, "l b y -> (l b) y"))
+        a_t = einops.rearrange(a_t, "(l b) a -> l b a", b=32)
+        u_t = torch.as_tensor(u, device=device)
+        u_t = einops.rearrange(u_t, "b l u -> l b u")
+
+        _, posteriors = dynamics_model(a=a_t, u=u_t)
+        x_posterior = bottle_mvn(posteriors).loc  # (T*B, x_dim)
+        x_posterior = einops.rearrange(x_posterior, "(l b) x -> l b x", b=32)
+
+        # posterior stats
+        x_mean = x_posterior.mean().item()
+        x_std = x_posterior.std().item()
+        x_min = x_posterior.min().item()
+        x_max = x_posterior.max().item()
+
+        # check Kalman covariance convergence: last vs first timestep
+        first_cov = posteriors[0].covariance_matrix[0]  # (x_dim, x_dim)
+        last_cov = posteriors[-1].covariance_matrix[0]
+        logger.info(f"  Posterior x stats: mean={x_mean:.4f}, std={x_std:.4f}, min={x_min:.4f}, max={x_max:.4f}")
+        logger.info(f"  Posterior cov trace (t=0): {first_cov.trace().item():.6f}")
+        logger.info(f"  Posterior cov trace (t={config.chunk_length-1}): {last_cov.trace().item():.6f}")
+        logger.info(f"  Posterior cov (t=0):\n{first_cov.cpu().numpy()}")
+        logger.info(f"  Posterior cov (t={config.chunk_length-1}):\n{last_cov.cpu().numpy()}")
+
+        # check: does C @ x_posterior reconstruct a well?
+        x_flat = einops.rearrange(x_posterior, "l b x -> (l b) x")
+        a_recon = dynamics_model.get_a(x_flat)
+        a_true = einops.rearrange(a_t, "l b a -> (l b) a")
+        recon_mse = nn.MSELoss()(a_recon, a_true).item()
+        logger.info(f"  C @ x_posterior vs a reconstruction MSE: {recon_mse:.6f}")
+
+        # check the actual Nx and Na being used
+        A_dyn, B_dyn, C_dyn, Nx_dyn, Na_dyn = dynamics_model.get_dynamics(x_flat[:1])
+        logger.info(f"  Nx (process noise cov):\n{Nx_dyn[0].cpu().numpy()}")
+        logger.info(f"  Na (observation noise cov):\n{Na_dyn[0].cpu().numpy()}")
 
     # evaluate on train and test data
     train_metrics = _evaluate_dynamics(config, encoder, dynamics_model, train_buffer, "train", device)
