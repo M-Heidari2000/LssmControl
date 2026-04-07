@@ -105,6 +105,53 @@ def train_autoencoder(
     return encoder, decoder
 
 
+def _normalize_state_basis(dynamics_model, encoder, train_buffer, device):
+    """
+        Normalize the state basis of a globally linear dynamics model via a
+        similarity transform so that states have approximately unit variance.
+        Preserves input-output behavior.
+    """
+    with torch.no_grad():
+        all_y = torch.as_tensor(train_buffer.ys[:len(train_buffer)], device=device)
+        all_a = encoder(all_y)
+
+        # estimate state variance: x ≈ C^+ @ a
+        C = dynamics_model.C.data
+        C_pinv = torch.linalg.pinv(C)
+        x_est = all_a @ C_pinv.T  # (N, x_dim)
+        x_std = x_est.std(dim=0)  # (x_dim,)
+        x_std = x_std.clamp(min=1e-6)
+
+        # similarity transform: x_new = T @ x_old, T = diag(1/std)
+        T = torch.diag(1.0 / x_std)
+        T_inv = torch.diag(x_std)
+
+        dynamics_model.A.copy_(T @ dynamics_model.A @ T_inv)
+        dynamics_model.B.copy_(T @ dynamics_model.B)
+        dynamics_model.C.copy_(dynamics_model.C @ T_inv)
+
+        if dynamics_model.diagonal_noise:
+            # diagonal noise: nx stores pre-sigmoid values, need to transform
+            # Nx_new = T @ diag(sigma(nx)) @ T = diag(sigma(nx) / std^2)
+            # this doesn't factor cleanly through sigmoid, so recompute:
+            # get current Nx diagonal values
+            min_var = dynamics_model._min_var
+            max_var = dynamics_model._max_var
+            nx_vals = min_var + (max_var - min_var) * torch.sigmoid(dynamics_model.nx)
+            nx_new = nx_vals / (x_std ** 2)
+            nx_new = nx_new.clamp(min=min_var + 1e-6, max=max_var - 1e-6)
+            nx_raw = (nx_new - min_var) / (max_var - min_var)
+            dynamics_model.nx.copy_(torch.log(nx_raw / (1.0 - nx_raw)))
+            # Na unchanged (observation space)
+        else:
+            Lx = torch.tril(dynamics_model.Lx)
+            Nx = Lx @ Lx.T
+            Nx_new = T @ Nx @ T
+            Lx_new = torch.linalg.cholesky(Nx_new)
+            dynamics_model.Lx.copy_(Lx_new)
+            # La unchanged (observation space)
+
+
 def train_dynamics(
     config: DictConfig,
     encoder: nn.Module,
@@ -273,6 +320,10 @@ def train_dynamics(
                     "global_step": update,
                 })
 
+    # normalize state basis for better cost model conditioning
+    if not config.locally_linear:
+        _normalize_state_basis(dynamics_model, encoder, train_buffer, device)
+
     return dynamics_model
 
 
@@ -415,24 +466,6 @@ def train_dynamics_sid(
         sid_horizon=config.sid_horizon,
     )
 
-    # normalize state basis so states have unit variance per dimension
-    # estimate state variance from data: run C^+ on all observations
-    C_pinv = np.linalg.pinv(C_id)
-    x_est = all_a @ C_pinv.T  # (N, x_dim)
-    x_std = x_est.std(axis=0)  # (x_dim,)
-    x_std = np.maximum(x_std, 1e-6)  # avoid division by zero
-
-    # similarity transform: x_new = T @ x_old, where T = diag(1/std)
-    T = np.diag(1.0 / x_std)
-    T_inv = np.diag(x_std)
-    A_id = T @ A_id @ T_inv
-    B_id = T @ B_id
-    C_id = C_id @ T_inv
-    Q = T @ Q @ T.T
-    # R is unchanged (observation space)
-
-    print(f"  State normalization: x_std = {x_std}")
-
     # create Dynamics model with full noise covariances (via Cholesky)
     dynamics_model = Dynamics(
         x_dim=config.x_dim,
@@ -450,12 +483,14 @@ def train_dynamics_sid(
         dynamics_model.B.copy_(torch.as_tensor(B_id, dtype=torch.float32))
         dynamics_model.C.copy_(torch.as_tensor(C_id, dtype=torch.float32))
 
-        # set full noise covariances via Cholesky factors: Nx = Lx @ Lx^T
         Lx = np.linalg.cholesky(Q.astype(np.float64))
         dynamics_model.Lx.copy_(torch.as_tensor(Lx, dtype=torch.float32))
 
         La = np.linalg.cholesky(R.astype(np.float64))
         dynamics_model.La.copy_(torch.as_tensor(La, dtype=torch.float32))
+
+    # normalize state basis for better cost model conditioning
+    _normalize_state_basis(dynamics_model, encoder, train_buffer, device)
 
     # freeze all dynamics parameters
     for p in dynamics_model.parameters():
