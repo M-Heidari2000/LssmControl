@@ -45,6 +45,8 @@ train:
     clip_grad_norm: 1.0
     disable_gpu: True
   dynamics:
+    method: prediction  # prediction or sid
+    sid_horizon: 10
     num_updates: 2000
     test_interval: 10
     x_dim: 2

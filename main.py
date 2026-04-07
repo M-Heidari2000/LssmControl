@@ -13,7 +13,7 @@ from omegaconf import OmegaConf
 from minari import MinariDataset
 from lssm.memory import ReplayBuffer
 from envs.utils import collect_data
-from lssm.train import train_autoencoder, train_dynamics
+from lssm.train import train_autoencoder, train_dynamics, train_dynamics_sid
 from lssm.evaluation import evaluate
 from lssm.utils import jsonify
 from lssm.models import IdentityEncoder, IdentityDecoder
@@ -89,13 +89,24 @@ if __name__ == "__main__":
         decoder = IdentityDecoder().to(device)
 
     # Stage 2: Train dynamics with frozen encoder
-    logging.info("training dynamics ...")
-    dynamics_model = train_dynamics(
-        config=config.train.dynamics,
-        encoder=encoder,
-        train_buffer=train_buffer,
-        test_buffer=test_buffer,
-    )
+    dynamics_method = config.train.dynamics.get("method", "prediction")
+    if dynamics_method == "sid" and not config.train.dynamics.locally_linear:
+        logging.info("identifying dynamics via SID ...")
+        dynamics_model = train_dynamics_sid(
+            config=config.train.dynamics,
+            encoder=encoder,
+            train_buffer=train_buffer,
+        )
+    else:
+        if dynamics_method == "sid" and config.train.dynamics.locally_linear:
+            logging.warning("SID not supported with locally_linear=True, falling back to prediction")
+        logging.info("training dynamics via prediction ...")
+        dynamics_model = train_dynamics(
+            config=config.train.dynamics,
+            encoder=encoder,
+            train_buffer=train_buffer,
+            test_buffer=test_buffer,
+        )
     torch.save(dynamics_model.state_dict(), save_dir / "dynamics_model.pth")
 
     # Stage 3: Evaluate (includes per-target cost training)

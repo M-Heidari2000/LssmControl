@@ -1,6 +1,8 @@
 import torch
 import wandb
 import einops
+import logging
+import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
 from omegaconf.dictconfig import DictConfig
@@ -13,6 +15,8 @@ from .models import (
     Dynamics,
     CostModel,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def train_autoencoder(
@@ -271,6 +275,102 @@ def train_dynamics(
                     "test/kl consistency": kl_consistency.item(),
                     "global_step": update,
                 })
+
+    return dynamics_model
+
+
+def train_dynamics_sid(
+    config: DictConfig,
+    encoder: nn.Module,
+    train_buffer: ReplayBuffer,
+):
+    """
+        Stage 2 (SID variant): Identify dynamics via subspace identification.
+        Uses PyPSID's IPSID with n1=0 (no preferential/behavioral signal).
+        Sets identified A, B, C, Nx, Na as fixed buffers on the Dynamics model.
+    """
+    from PSID import IPSID
+
+    device = "cuda" if (torch.cuda.is_available() and not config.disable_gpu) else "cpu"
+
+    # freeze encoder
+    for p in encoder.parameters():
+        p.requires_grad = False
+    encoder.eval()
+
+    # encode all observations to a-space
+    with torch.no_grad():
+        all_y = torch.as_tensor(train_buffer.ys[:len(train_buffer)], device=device)
+        all_a = encoder(all_y).cpu().numpy()
+    all_u = train_buffer.us[:len(train_buffer)]
+    all_done = train_buffer.done[:len(train_buffer)].flatten()
+
+    # split into per-episode lists (IPSID natively supports list of segments)
+    episode_ends = np.where(all_done)[0]
+    episode_starts = np.concatenate([[0], episode_ends[:-1] + 1])
+
+    a_episodes = []
+    u_episodes = []
+    for start, end in zip(episode_starts, episode_ends):
+        a_episodes.append(all_a[start:end + 1])  # (T_i, a_dim)
+        u_episodes.append(all_u[start:end + 1])  # (T_i, u_dim)
+
+    total_samples = sum(len(ep) for ep in a_episodes)
+    logger.info(f"Running SID on {len(a_episodes)} episodes ({total_samples} total samples) with horizon i={config.sid_horizon}")
+
+    # run IPSID: vanilla SID with inputs (n1=0, no behavioral signal)
+    # pass lists of per-episode arrays — IPSID handles boundaries internally
+    id_sys = IPSID(
+        Y=a_episodes,
+        Z=None,
+        U=u_episodes,
+        nx=config.x_dim,
+        n1=0,
+        i=config.sid_horizon,
+        remove_mean_Y=False,
+        remove_mean_U=False,
+    )
+
+    # create Dynamics model and set identified parameters as fixed buffers
+    dynamics_model = Dynamics(
+        x_dim=config.x_dim,
+        u_dim=train_buffer.u_dim,
+        a_dim=config.a_dim,
+        hidden_dim=config.hidden_dim,
+        min_var=config.min_var,
+        max_var=config.max_var,
+        locally_linear=False,
+    ).to(device)
+
+    with torch.no_grad():
+        dynamics_model.A.copy_(torch.as_tensor(id_sys.A, dtype=torch.float32))
+        dynamics_model.B.copy_(torch.as_tensor(id_sys.B, dtype=torch.float32))
+        dynamics_model.C.copy_(torch.as_tensor(id_sys.C, dtype=torch.float32))
+
+        # set noise covariances: extract diagonal and invert the sigmoid
+        # Nx = diag(min_var + (max_var - min_var) * sigmoid(nx))
+        # so nx = sigmoid_inv((diag(Q) - min_var) / (max_var - min_var))
+        q_diag = np.diag(id_sys.Q).clip(config.min_var + 1e-6, config.max_var - 1e-6)
+        nx_raw = (q_diag - config.min_var) / (config.max_var - config.min_var)
+        nx_logit = np.log(nx_raw / (1.0 - nx_raw))  # inverse sigmoid
+        dynamics_model.nx.copy_(torch.as_tensor(nx_logit, dtype=torch.float32))
+
+        r_diag = np.diag(id_sys.R).clip(config.min_var + 1e-6, config.max_var - 1e-6)
+        na_raw = (r_diag - config.min_var) / (config.max_var - config.min_var)
+        na_logit = np.log(na_raw / (1.0 - na_raw))  # inverse sigmoid
+        dynamics_model.na.copy_(torch.as_tensor(na_logit, dtype=torch.float32))
+
+    # freeze all dynamics parameters
+    for p in dynamics_model.parameters():
+        p.requires_grad = False
+    dynamics_model.eval()
+
+    logger.info("SID identification complete.")
+    logger.info(f"  A:\n{id_sys.A}")
+    logger.info(f"  B:\n{id_sys.B}")
+    logger.info(f"  C:\n{id_sys.C}")
+    logger.info(f"  Q diag: {np.diag(id_sys.Q)}")
+    logger.info(f"  R diag: {np.diag(id_sys.R)}")
 
     return dynamics_model
 
