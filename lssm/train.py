@@ -107,24 +107,20 @@ def train_autoencoder(
 def train_dynamics(
     config: DictConfig,
     encoder: nn.Module,
-    decoder: nn.Module,
     train_buffer: ReplayBuffer,
     test_buffer: ReplayBuffer,
 ):
     """
-        Stage 2: Train dynamics model with frozen encoder and decoder.
-        Uses the same losses as DFINE backbone: filtering, k-step prediction, consistency.
+        Stage 2: Train dynamics model with frozen encoder.
+        Losses are computed in a-space (latent observation space).
     """
 
     device = "cuda" if (torch.cuda.is_available() and not config.disable_gpu) else "cpu"
 
-    # freeze encoder and decoder
+    # freeze encoder
     for p in encoder.parameters():
         p.requires_grad = False
-    for p in decoder.parameters():
-        p.requires_grad = False
     encoder.eval()
-    decoder.eval()
 
     dynamics_model = Dynamics(
         x_dim=config.x_dim,
@@ -174,12 +170,10 @@ def train_dynamics(
         kl_consistency = consistencies[1]
 
         filter_a = dynamics_model.get_a(bottle_mvn(posteriors).loc)
-        y_filter_loss = nn.MSELoss()(
-            decoder(filter_a),
-            einops.rearrange(y, "l b y -> (l b) y")
-        )
+        a_flatten = einops.rearrange(a, "l b a -> (l b) a")
+        a_filter_loss = nn.MSELoss()(filter_a, a_flatten)
 
-        y_pred_loss = 0.0
+        a_pred_loss = 0.0
         for k in range(1, config.prediction_k+1):
             pred_dist = bottle_mvn(posteriors[0:config.chunk_length-k])
             for t in range(k):
@@ -188,21 +182,14 @@ def train_dynamics(
                     u=einops.rearrange(u[t:config.chunk_length-k+t], "l b u -> (l b) u"),
                 )
             pred_a = dynamics_model.get_a(pred_dist.loc)
-            pred_y = decoder(pred_a)
-            true_y = einops.rearrange(y[k:config.chunk_length], "l b y -> (l b) y")
-            y_pred_loss += nn.MSELoss()(pred_y, true_y) * (config.chunk_length - k) / config.chunk_length
+            true_a = einops.rearrange(a[k:config.chunk_length], "l b a -> (l b) a")
+            a_pred_loss += nn.MSELoss()(pred_a, true_a) * (config.chunk_length - k) / config.chunk_length
 
-        # y prediction loss
-        y_pred_loss /= config.prediction_k
-        # autoencoder loss (logged only, not in training loss)
-        a_flatten = einops.rearrange(a, "l b a -> (l b) a")
-        y_flatten = einops.rearrange(y, "l b y -> (l b) y")
-        y_recon = decoder(a_flatten)
-        ae_loss = nn.MSELoss()(y_recon, y_flatten)
+        a_pred_loss /= config.prediction_k
 
         total_loss = (
-            y_pred_loss +
-            config.filtering_weight * y_filter_loss +
+            a_pred_loss +
+            config.filtering_weight * a_filter_loss +
             config.mean_consistency_weight * mean_consistency +
             config.kl_consistency_weight * kl_consistency
         )
@@ -215,9 +202,8 @@ def train_dynamics(
         scheduler.step()
 
         wandb.log({
-            "train/y prediction loss": y_pred_loss.item(),
-            "train/y filter loss": y_filter_loss.item(),
-            "train/ae loss": ae_loss.item(),
+            "train/a prediction loss": a_pred_loss.item(),
+            "train/a filter loss": a_filter_loss.item(),
             "train/total loss": total_loss.item(),
             "train/mean consistency": mean_consistency.item(),
             "train/kl consistency": kl_consistency.item(),
@@ -253,12 +239,10 @@ def train_dynamics(
                 kl_consistency = consistencies[1]
 
                 filter_a = dynamics_model.get_a(bottle_mvn(posteriors).loc)
-                y_filter_loss = nn.MSELoss()(
-                    decoder(filter_a),
-                    einops.rearrange(y, "l b y -> (l b) y")
-                )
+                a_flatten = einops.rearrange(a, "l b a -> (l b) a")
+                a_filter_loss = nn.MSELoss()(filter_a, a_flatten)
 
-                y_pred_loss = 0.0
+                a_pred_loss = 0.0
                 for k in range(1, config.prediction_k+1):
                     pred_dist = bottle_mvn(posteriors[0:config.chunk_length-k])
                     for t in range(k):
@@ -267,30 +251,21 @@ def train_dynamics(
                             u=einops.rearrange(u[t:config.chunk_length-k+t], "l b u -> (l b) u"),
                         )
                     pred_a = dynamics_model.get_a(pred_dist.loc)
-                    pred_y = decoder(pred_a)
-                    true_y = einops.rearrange(y[k:config.chunk_length], "l b y -> (l b) y")
-                    y_pred_loss += nn.MSELoss()(pred_y, true_y) * (config.chunk_length - k) / config.chunk_length
+                    true_a = einops.rearrange(a[k:config.chunk_length], "l b a -> (l b) a")
+                    a_pred_loss += nn.MSELoss()(pred_a, true_a) * (config.chunk_length - k) / config.chunk_length
 
-                # y prediction loss
-                y_pred_loss /= config.prediction_k
-
-                # autoencoder loss
-                a_flatten = einops.rearrange(a, "l b a -> (l b) a")
-                y_flatten = einops.rearrange(y, "l b y -> (l b) y")
-                y_recon = decoder(a_flatten)
-                ae_loss = nn.MSELoss()(y_recon, y_flatten)
+                a_pred_loss /= config.prediction_k
 
                 total_loss = (
-                    y_pred_loss +
-                    config.filtering_weight * y_filter_loss +
+                    a_pred_loss +
+                    config.filtering_weight * a_filter_loss +
                     config.mean_consistency_weight * mean_consistency +
                     config.kl_consistency_weight * kl_consistency
                 )
 
                 wandb.log({
-                    "test/y prediction loss": y_pred_loss.item(),
-                    "test/y filter loss": y_filter_loss.item(),
-                    "test/ae loss": ae_loss.item(),
+                    "test/a prediction loss": a_pred_loss.item(),
+                    "test/a filter loss": a_filter_loss.item(),
                     "test/total loss": total_loss.item(),
                     "test/mean consistency": mean_consistency.item(),
                     "test/kl consistency": kl_consistency.item(),

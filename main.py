@@ -88,12 +88,11 @@ if __name__ == "__main__":
         encoder = IdentityEncoder().to(device)
         decoder = IdentityDecoder().to(device)
 
-    # Stage 2: Train dynamics with frozen encoder/decoder
+    # Stage 2: Train dynamics with frozen encoder
     logging.info("training dynamics ...")
     dynamics_model = train_dynamics(
         config=config.train.dynamics,
         encoder=encoder,
-        decoder=decoder,
         train_buffer=train_buffer,
         test_buffer=test_buffer,
     )
