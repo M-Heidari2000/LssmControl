@@ -350,6 +350,93 @@ def _evaluate_dynamics(
     return metrics
 
 
+def _sid_identify(a_episodes, u_episodes, x_dim, sid_horizon):
+    """
+        Subspace identification with inputs, without feedthrough (D=0).
+        Uses IPSID internals for the core SID steps (oblique projections, SVD),
+        then identifies B via simple least squares instead of the joint B/D solve.
+
+        Returns: A, B, C, Q, R (all numpy arrays)
+    """
+    from PSID.PSID import blkhankskip, projOrth, getHSize
+    from PSID.IPSID import projOblique, removeProjOrth
+    from scipy import linalg
+
+    iY = sid_horizon
+    iMax = iY
+    ny = a_episodes[0].shape[1]
+    nu = u_episodes[0].shape[1]
+
+    # compute per-episode valid lengths for Hankel construction
+    N = []
+    for ep in a_episodes:
+        T = ep.shape[0]
+        N.append(T - 2 * iMax + 1)
+
+    # build block Hankel matrices (IPSID-style, handles multi-episode via lists)
+    Yp = blkhankskip(a_episodes, iY, N, iMax - iY, time_first=True)
+    Yf = blkhankskip(a_episodes, iY, N, iMax, time_first=True)
+    Yii = blkhankskip(a_episodes, 1, N, iMax, time_first=True)
+    Up = blkhankskip(u_episodes, iY, N, iMax - iY, time_first=True)
+    Uf = blkhankskip(u_episodes, iY, N, iMax, time_first=True)
+
+    NTot = Yp.shape[1]
+    nx = x_dim
+
+    # Stage 2 (only stage, since n1=0): identify Y-predictive states
+    # oblique projection of Yf onto [Up, Yp] along Uf
+    YHatOb = projOblique(Yf, np.concatenate((Up, Yp)), Uf)[0]
+    YHatObUfRes = removeProjOrth(YHatOb, Uf)
+
+    # orthogonal projection of Yf onto [Up, Yp, Uf]
+    YHat = projOrth(Yf, np.concatenate((Up, Yp, Uf)))[0]
+
+    # for shifted states: Yf_Minus, Uf_Minus
+    Yf_Minus = Yf[ny:, :]
+    Uf_Minus = Uf[nu:, :]
+    Uii = blkhankskip(u_episodes, 1, N, iMax, time_first=True)
+    YHatMinus = projOrth(
+        Yf_Minus,
+        np.concatenate((Up, Uii, Yp, Yii, Uf_Minus)),
+    )[0]
+
+    # SVD
+    U2, S2_vals, _ = linalg.svd(YHatObUfRes, full_matrices=False, lapack_driver="gesvd")
+    S2 = np.diag(S2_vals[:nx])
+    U2 = U2[:, :nx]
+
+    Oy = U2 @ S2 ** (1 / 2)
+    Oy_Minus = Oy[:-ny, :]
+
+    Xk = np.linalg.pinv(Oy) @ YHat
+    Xk_Plus1 = np.linalg.pinv(Oy_Minus) @ YHatMinus
+
+    # identify A: regress Xk_Plus1 on [Xk, Uf] to project out input effects
+    XkP2Hat, A_tmp = projOrth(Xk_Plus1, np.concatenate((Xk, Uf)))
+    A = A_tmp[:, :nx]
+    w = Xk_Plus1 - XkP2Hat
+
+    # identify C: regress Yii on [Xk, Uf] to project out input effects
+    YiiHat, Cy_tmp = projOrth(Yii, np.concatenate((Xk, Uf)))
+    C = Cy_tmp[:, :nx]
+    v = Yii - YiiHat
+
+    # noise covariances (already clean — input effects projected out)
+    NA = w.shape[1]
+    Q = (w @ w.T) / NA
+    Q = (Q + Q.T) / 2
+    R = (v @ v.T) / NA
+    R = (R + R.T) / 2
+
+    # identify B via least squares: x_{k+1} - A @ x_k = B @ u_k + w_k
+    # use reconstructed state sequences
+    Uii_flat = Uii  # (nu, NTot)
+    rhs = Xk_Plus1 - A @ Xk  # (nx, NTot)
+    B = (rhs @ Uii_flat.T) @ np.linalg.pinv(Uii_flat @ Uii_flat.T)  # (nx, nu)
+
+    return A, B, C, Q, R
+
+
 def train_dynamics_sid(
     config: DictConfig,
     encoder: nn.Module,
@@ -358,10 +445,9 @@ def train_dynamics_sid(
 ):
     """
         Stage 2 (SID variant): Identify dynamics via subspace identification.
-        Uses PyPSID's IPSID with n1=0 (no preferential/behavioral signal).
-        Sets identified A, B, C, Nx, Na as fixed buffers on the Dynamics model.
+        Uses SID with inputs but without feedthrough (D=0).
+        Sets identified A, B, C, Q, R as fixed parameters on the Dynamics model.
     """
-    from PSID import IPSID
 
     device = "cuda" if (torch.cuda.is_available() and not config.disable_gpu) else "cpu"
 
@@ -377,7 +463,7 @@ def train_dynamics_sid(
     all_u = train_buffer.us[:len(train_buffer)]
     all_done = train_buffer.done[:len(train_buffer)].flatten()
 
-    # split into per-episode lists (IPSID natively supports list of segments)
+    # split into per-episode lists
     episode_ends = np.where(all_done)[0]
     episode_starts = np.concatenate([[0], episode_ends[:-1] + 1])
 
@@ -390,17 +476,12 @@ def train_dynamics_sid(
     total_samples = sum(len(ep) for ep in a_episodes)
     logger.info(f"Running SID on {len(a_episodes)} episodes ({total_samples} total samples) with horizon i={config.sid_horizon}")
 
-    # run IPSID: vanilla SID with inputs (n1=0, no behavioral signal)
-    # pass lists of per-episode arrays — IPSID handles boundaries internally
-    id_sys = IPSID(
-        Y=a_episodes,
-        Z=None,
-        U=u_episodes,
-        nx=config.x_dim,
-        n1=0,
-        i=config.sid_horizon,
-        remove_mean_Y=False,
-        remove_mean_U=False,
+    # run SID identification (no D)
+    A_id, B_id, C_id, Q, R = _sid_identify(
+        a_episodes=a_episodes,
+        u_episodes=u_episodes,
+        x_dim=config.x_dim,
+        sid_horizon=config.sid_horizon,
     )
 
     # create Dynamics model with full noise covariances (via Cholesky)
@@ -416,19 +497,15 @@ def train_dynamics_sid(
     ).to(device)
 
     with torch.no_grad():
-        dynamics_model.A.copy_(torch.as_tensor(id_sys.A, dtype=torch.float32))
-        dynamics_model.B.copy_(torch.as_tensor(id_sys.B, dtype=torch.float32))
-        dynamics_model.C.copy_(torch.as_tensor(id_sys.C, dtype=torch.float32))
+        dynamics_model.A.copy_(torch.as_tensor(A_id, dtype=torch.float32))
+        dynamics_model.B.copy_(torch.as_tensor(B_id, dtype=torch.float32))
+        dynamics_model.C.copy_(torch.as_tensor(C_id, dtype=torch.float32))
 
         # set full noise covariances via Cholesky factors: Nx = Lx @ Lx^T
-        Q = id_sys.Q.astype(np.float64)
-        Q = (Q + Q.T) / 2
-        Lx = np.linalg.cholesky(Q)
+        Lx = np.linalg.cholesky(Q.astype(np.float64))
         dynamics_model.Lx.copy_(torch.as_tensor(Lx, dtype=torch.float32))
 
-        R = id_sys.R.astype(np.float64)
-        R = (R + R.T) / 2
-        La = np.linalg.cholesky(R)
+        La = np.linalg.cholesky(R.astype(np.float64))
         dynamics_model.La.copy_(torch.as_tensor(La, dtype=torch.float32))
 
     # freeze all dynamics parameters
@@ -437,11 +514,11 @@ def train_dynamics_sid(
     dynamics_model.eval()
 
     logger.info("SID identification complete.")
-    logger.info(f"  A:\n{id_sys.A}")
-    logger.info(f"  B:\n{id_sys.B}")
-    logger.info(f"  C:\n{id_sys.C}")
-    logger.info(f"  Q diag: {np.diag(id_sys.Q)}")
-    logger.info(f"  R diag: {np.diag(id_sys.R)}")
+    logger.info(f"  A:\n{A_id}")
+    logger.info(f"  B:\n{B_id}")
+    logger.info(f"  C:\n{C_id}")
+    logger.info(f"  Q:\n{Q}")
+    logger.info(f"  R:\n{R}")
 
     # evaluate on train and test data
     train_metrics = _evaluate_dynamics(config, encoder, dynamics_model, train_buffer, "train", device)
