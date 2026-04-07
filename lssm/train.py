@@ -279,10 +279,82 @@ def train_dynamics(
     return dynamics_model
 
 
+def _evaluate_dynamics(
+    config: DictConfig,
+    encoder: nn.Module,
+    dynamics_model: Dynamics,
+    buffer: ReplayBuffer,
+    prefix: str,
+    device: str,
+):
+    """
+        Evaluate dynamics model on a buffer. Computes the same metrics as the
+        prediction-based training loop: a-filter loss, a-prediction loss, consistency.
+    """
+    with torch.no_grad():
+        y, u, _, _ = buffer.sample(
+            batch_size=config.batch_size,
+            chunk_length=config.chunk_length,
+        )
+
+        y = torch.as_tensor(y, device=device)
+        y = einops.rearrange(y, "b l y -> l b y")
+        a = encoder(einops.rearrange(y, "l b y -> (l b) y"))
+        a = einops.rearrange(a, "(l b) a -> l b a", b=config.batch_size)
+        u = torch.as_tensor(u, device=device)
+        u = einops.rearrange(u, "b l u -> l b u")
+
+        priors, posteriors = dynamics_model(a=a, u=u)
+
+        consistencies = compute_consistency(
+            prior=bottle_mvn(priors),
+            posterior=bottle_mvn(posteriors),
+            free_nats=config.kl_free_nats
+        )
+        mean_consistency = consistencies[0]
+        kl_consistency = consistencies[1]
+
+        filter_a = dynamics_model.get_a(bottle_mvn(posteriors).loc)
+        a_flatten = einops.rearrange(a, "l b a -> (l b) a")
+        a_filter_loss = nn.MSELoss()(filter_a, a_flatten)
+
+        a_pred_loss = 0.0
+        for k in range(1, config.prediction_k + 1):
+            pred_dist = bottle_mvn(posteriors[0:config.chunk_length - k])
+            for t in range(k):
+                pred_dist = dynamics_model.prior(
+                    dist=pred_dist,
+                    u=einops.rearrange(u[t:config.chunk_length - k + t], "l b u -> (l b) u"),
+                )
+            pred_a = dynamics_model.get_a(pred_dist.loc)
+            true_a = einops.rearrange(a[k:config.chunk_length], "l b a -> (l b) a")
+            a_pred_loss += nn.MSELoss()(pred_a, true_a) * (config.chunk_length - k) / config.chunk_length
+
+        a_pred_loss /= config.prediction_k
+
+        total_loss = (
+            a_pred_loss +
+            config.filtering_weight * a_filter_loss +
+            config.mean_consistency_weight * mean_consistency +
+            config.kl_consistency_weight * kl_consistency
+        )
+
+        metrics = {
+            f"{prefix}/a prediction loss": a_pred_loss.item(),
+            f"{prefix}/a filter loss": a_filter_loss.item(),
+            f"{prefix}/total loss": total_loss.item(),
+            f"{prefix}/mean consistency": mean_consistency.item(),
+            f"{prefix}/kl consistency": kl_consistency.item(),
+        }
+
+    return metrics
+
+
 def train_dynamics_sid(
     config: DictConfig,
     encoder: nn.Module,
     train_buffer: ReplayBuffer,
+    test_buffer: ReplayBuffer,
 ):
     """
         Stage 2 (SID variant): Identify dynamics via subspace identification.
@@ -371,6 +443,11 @@ def train_dynamics_sid(
     logger.info(f"  C:\n{id_sys.C}")
     logger.info(f"  Q diag: {np.diag(id_sys.Q)}")
     logger.info(f"  R diag: {np.diag(id_sys.R)}")
+
+    # evaluate on train and test data
+    train_metrics = _evaluate_dynamics(config, encoder, dynamics_model, train_buffer, "train", device)
+    test_metrics = _evaluate_dynamics(config, encoder, dynamics_model, test_buffer, "test", device)
+    wandb.log({**train_metrics, **test_metrics, "global_step": 0})
 
     return dynamics_model
 

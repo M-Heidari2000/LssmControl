@@ -96,6 +96,7 @@ if __name__ == "__main__":
             config=config.train.dynamics,
             encoder=encoder,
             train_buffer=train_buffer,
+            test_buffer=test_buffer,
         )
     else:
         if dynamics_method == "sid" and config.train.dynamics.locally_linear:
