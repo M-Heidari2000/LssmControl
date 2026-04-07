@@ -81,12 +81,15 @@ if __name__ == "__main__":
         )
         torch.save(encoder.state_dict(), save_dir / "encoder.pth")
         torch.save(decoder.state_dict(), save_dir / "decoder.pth")
+        # a_dim comes from the autoencoder config
+        config.train.dynamics.a_dim = config.train.autoencoder.a_dim
     else:
-        # Identity: no learned encoder/decoder
+        # Identity: no learned encoder/decoder, a_dim = y_dim
         logging.info("using identity encoder/decoder ...")
         device = "cuda" if (torch.cuda.is_available() and not config.train.dynamics.disable_gpu) else "cpu"
         encoder = IdentityEncoder().to(device)
         decoder = IdentityDecoder().to(device)
+        config.train.dynamics.a_dim = train_buffer.y_dim
 
     # Stage 2: Train dynamics with frozen encoder
     dynamics_method = config.train.dynamics.get("method", "prediction")
