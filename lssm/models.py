@@ -103,6 +103,7 @@ class Dynamics(nn.Module):
         min_var: float=1e-2,
         max_var: float=1.0,
         locally_linear: Optional[bool]=False,
+        diagonal_noise: Optional[bool]=True,
     ):
         super().__init__()
 
@@ -112,6 +113,7 @@ class Dynamics(nn.Module):
         self._min_var = min_var
         self._max_var = max_var
         self.locally_linear = locally_linear
+        self.diagonal_noise = diagonal_noise
 
         if self.locally_linear:
             self.backbone = nn.Sequential(
@@ -133,8 +135,13 @@ class Dynamics(nn.Module):
             self.A = nn.Parameter(torch.eye(x_dim))
             self.B = nn.Parameter(torch.randn(x_dim, u_dim))
             self.C = nn.Parameter(torch.randn(a_dim, x_dim))
-            self.nx = nn.Parameter(torch.randn(x_dim))
-            self.na = nn.Parameter(torch.randn(a_dim))
+            if self.diagonal_noise:
+                self.nx = nn.Parameter(torch.randn(x_dim))
+                self.na = nn.Parameter(torch.randn(a_dim))
+            else:
+                # full covariance via Cholesky factors: Nx = Lx @ Lx^T
+                self.Lx = nn.Parameter(torch.eye(x_dim))
+                self.La = nn.Parameter(torch.eye(a_dim))
 
     def _init_weights(self):
         for m in self.backbone.modules():
@@ -167,8 +174,14 @@ class Dynamics(nn.Module):
             A = self.A.expand(b, -1, -1)
             B = self.B.expand(b, -1, -1)
             C = self.C.expand(b, -1, -1)
-            Nx = torch.diag_embed(self._min_var + (self._max_var - self._min_var) * torch.sigmoid(self.nx)).expand(b, -1, -1)
-            Na = torch.diag_embed(self._min_var + (self._max_var - self._min_var) * torch.sigmoid(self.na)).expand(b, -1, -1)
+            if self.diagonal_noise:
+                Nx = torch.diag_embed(self._min_var + (self._max_var - self._min_var) * torch.sigmoid(self.nx)).expand(b, -1, -1)
+                Na = torch.diag_embed(self._min_var + (self._max_var - self._min_var) * torch.sigmoid(self.na)).expand(b, -1, -1)
+            else:
+                Lx = torch.tril(self.Lx)
+                La = torch.tril(self.La)
+                Nx = (Lx @ Lx.T).expand(b, -1, -1)
+                Na = (La @ La.T).expand(b, -1, -1)
 
         return A, B, C, Nx, Na
 

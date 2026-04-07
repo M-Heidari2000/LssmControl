@@ -403,7 +403,7 @@ def train_dynamics_sid(
         remove_mean_U=False,
     )
 
-    # create Dynamics model and set identified parameters as fixed buffers
+    # create Dynamics model with full noise covariances (via Cholesky)
     dynamics_model = Dynamics(
         x_dim=config.x_dim,
         u_dim=train_buffer.u_dim,
@@ -412,6 +412,7 @@ def train_dynamics_sid(
         min_var=config.min_var,
         max_var=config.max_var,
         locally_linear=False,
+        diagonal_noise=False,
     ).to(device)
 
     with torch.no_grad():
@@ -419,18 +420,16 @@ def train_dynamics_sid(
         dynamics_model.B.copy_(torch.as_tensor(id_sys.B, dtype=torch.float32))
         dynamics_model.C.copy_(torch.as_tensor(id_sys.C, dtype=torch.float32))
 
-        # set noise covariances: extract diagonal and invert the sigmoid
-        # Nx = diag(min_var + (max_var - min_var) * sigmoid(nx))
-        # so nx = sigmoid_inv((diag(Q) - min_var) / (max_var - min_var))
-        q_diag = np.diag(id_sys.Q).clip(config.min_var + 1e-6, config.max_var - 1e-6)
-        nx_raw = (q_diag - config.min_var) / (config.max_var - config.min_var)
-        nx_logit = np.log(nx_raw / (1.0 - nx_raw))  # inverse sigmoid
-        dynamics_model.nx.copy_(torch.as_tensor(nx_logit, dtype=torch.float32))
+        # set full noise covariances via Cholesky factors: Nx = Lx @ Lx^T
+        Q = id_sys.Q.astype(np.float64)
+        Q = (Q + Q.T) / 2
+        Lx = np.linalg.cholesky(Q)
+        dynamics_model.Lx.copy_(torch.as_tensor(Lx, dtype=torch.float32))
 
-        r_diag = np.diag(id_sys.R).clip(config.min_var + 1e-6, config.max_var - 1e-6)
-        na_raw = (r_diag - config.min_var) / (config.max_var - config.min_var)
-        na_logit = np.log(na_raw / (1.0 - na_raw))  # inverse sigmoid
-        dynamics_model.na.copy_(torch.as_tensor(na_logit, dtype=torch.float32))
+        R = id_sys.R.astype(np.float64)
+        R = (R + R.T) / 2
+        La = np.linalg.cholesky(R)
+        dynamics_model.La.copy_(torch.as_tensor(La, dtype=torch.float32))
 
     # freeze all dynamics parameters
     for p in dynamics_model.parameters():
