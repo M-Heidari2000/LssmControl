@@ -3,6 +3,7 @@ from .circle import Circle
 from .swiss_roll import SwissRoll
 from .cos import Cos
 from .linear import Linear
+from .linear1d import Linear1D
 import numpy as np
 from omegaconf.dictconfig import DictConfig
 
@@ -55,6 +56,17 @@ def make(config: DictConfig):
             )
         case "linear":
             env = Linear(
+                A=np.array(config.A),
+                B=np.array(config.B),
+                C=np.array(config.C),
+                Ns=np.array(config.Ns),
+                No=np.array(config.No),
+                horizon=config.horizon,
+                render_mode="rgb_array",
+                periodic=config.periodic,
+            )
+        case "linear1d":
+            env = Linear1D(
                 A=np.array(config.A),
                 B=np.array(config.B),
                 C=np.array(config.C),

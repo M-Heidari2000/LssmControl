@@ -5,9 +5,9 @@ run_name: "LSSM"
 
 data:
   test_ratio: 0.2
-  num_episodes: 1000
+  num_episodes: 10000
   action_repeat: 1
-  dist: normal  # env, normal, or uniform
+  dist: uniform  # env, normal, or uniform
   u_std: 0.3   # std for normal dist
   u_max: 0.3   # range for uniform dist [-u_max, u_max]
 
@@ -17,11 +17,11 @@ env:
   periodic: False
 
   A:
-    - [1.0, 0.0]
-    - [0.0, 1.0]
+    - [0.0, -0.8]
+    - [1.0, 0.2]
   B:
-    - [1.0, 0.0]
-    - [0.0, 1.0]
+    - [3.0, 0.0]
+    - [0.0, 3.0]
   Ns:
     - [0.01, 0.0]
     - [0.0, 0.01]
@@ -79,6 +79,6 @@ train:
 
 evaluation:
   num_points: 1
-  num_regions: 1
+  num_regions: 4
   deterministic: True
   planning_horizon: 8
